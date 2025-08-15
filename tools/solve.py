@@ -1,21 +1,50 @@
-# tools/solve.py
-# Standalone FCC tetra-spheres solver driver (rev13.2)
-# - Writes world JSON snapshots + world-view layer printouts
-# - Periodic status with correct attempts/sec (monotonic window)
-# - CLI tunables for branch caps, roulette, TT limits, etc.
+# tools/solve.py — FCC tetra-spheres solver runner (CLI)
+# Runs the core search engine and writes ONLY the final solution
+# as:
+#   1) JSON (world coordinates per piece) — format matching example `solution_0026.world.json`
+#   2) TXT  (world FCC layer printout with piece letters)
+#
+# Usage (PowerShell):
+#   cd "C:\\Grasshopper\\Projects\\Projects\\2025\\ball puzzle\\solver"
+#   $env:PYTHONPATH = (Get-Location)
+#   python tools\\solve.py `
+#     --container "data\\containers\\Roof.json" `
+#     --pieces "data\\pieces\\pieces.py" `
+#     --out "out\\Roof_run2" `
+#     --present auto `
+#     --status-interval 5 `
+#     --max-seconds 0 `
+#     --max-attempts 0 `
+#     --branch-cap-open 18 `
+#     --branch-cap-tight 8 `
+#     --deg2-corridor 1 `
+#     --roulette least-tried `
+#     --tt-max 6000000 `
+#     --tt-trim-keep 5000000
+#
+# Notes:
+# - We do NOT write per-depth snapshots anymore.
+# - We do NOT depend on Streamlit.
+# - Advanced knobs are applied to the engine post-construction when available (hasattr checks).
+# - Status line is printed every --status-interval seconds with a rolling attempts/sec.
+# - The rate shown is computed from the engine's .attempts counter delta over the interval.
 
 from __future__ import annotations
 
-import os, sys, json, time, argparse
-from typing import Dict, Tuple, List, Set
+import argparse
+import json
+import os
+import sys
+import time
+import hashlib
+from collections import defaultdict
+import math
+import importlib.util
 
-# ---------------------------------------------------------------------
-# Import path fix: allow `from core...` when launching from tools/
-# ---------------------------------------------------------------------
-THIS_DIR = os.path.dirname(os.path.abspath(__file__))
-ROOT_DIR = os.path.abspath(os.path.join(THIS_DIR, ".."))
-if ROOT_DIR not in sys.path:
-    sys.path.insert(0, ROOT_DIR)
+# --- Robust import of core.solver_engine ---------------------------------------------------------
+REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), os.pardir))
+if REPO_ROOT not in sys.path:
+    sys.path.insert(0, REPO_ROOT)
 
 try:
     from core.solver_engine import SolverEngine
@@ -23,92 +52,82 @@ except Exception as e:
     print("[ERR] Could not import core.solver_engine.SolverEngine:", e)
     raise
 
-try:
-    from core.io_pieces import load_pieces
-except Exception:
-    # Fallback: local loader compatible with PIECES dict in a .py file
-    import importlib.util
-    def _local_load_pieces(py_path: str) -> Dict[str, tuple]:
-        p = py_path.strip()
-        if not p.lower().endswith(".py"):
-            raise IOError("Pieces path must end with .py")
-        if not os.path.isfile(p):
-            raise IOError("File not found: {}".format(p))
-        name = "__pieces__"
-        if name in sys.modules:
-            del sys.modules[name]
-        spec = importlib.util.spec_from_file_location(name, p)
-        if spec is None or spec.loader is None:
-            raise ImportError("Invalid module spec for: {}".format(p))
-        mod = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(mod)
-        if not hasattr(mod, "PIECES"):
-            raise ImportError("Module has no PIECES dict: {}".format(p))
-        pieces = {}
-        for key, oris in mod.PIECES.items():
-            norm_oris = []
-            for ori in oris:
-                norm_oris.append(tuple(tuple(int(c) for c in triplet) for triplet in ori))
-            pieces[str(key)] = tuple(norm_oris)
-        return pieces
-    load_pieces = _local_load_pieces
+# --- FCC helpers ---------------------------------------------------------------------------------
+def fcc_point(i:int, j:int, k:int, r:float):
+    """Map FCC lattice (i,j,k) -> world xyz where spheres of radius r just touch."""
+    s = math.sqrt(2.0) * float(r)
+    return (s * (j + k), s * (i + k), s * (i + j))
 
-
-# ---------------------------------------------------------------------
-# Container JSON loader
-#   Expects:
-#     {
-#       "r": <float> or "radius": <float>,
-#       "cells": [[i,j,k], ...],
-#       "presentation": { ... }   // optional, not passed to engine; kept in snapshot meta
-#     }
-# ---------------------------------------------------------------------
-def load_container_json(path: str) -> Tuple[Set[Tuple[int,int,int]], Tuple[int,int,int,int,int,int], float, dict]:
+# --- Container JSON loader -----------------------------------------------------------------------
+def load_container_json(path:str):
+    """
+    Expected container JSON (minimal):
+    {
+      "version": 1,
+      "name": "Roof",
+      "lattice": "fcc",
+      "r": 1.0,
+      "cells": [[i,j,k], ...]
+    }
+    Optional: "presentation" (ignored by solver; passed through in final JSON)
+    Returns: (valid_set, r, name, presentation_dict_or_None)
+    """
     with open(path, "r") as f:
-        data = json.load(f)
+        obj = json.load(f)
+    if obj.get("lattice", "fcc").lower() != "fcc":
+        raise ValueError("Only 'fcc' lattice is supported")
 
-    cells = data.get("cells") or data.get("lattice") or []
-    if not isinstance(cells, list) or not cells:
-        raise ValueError("Container JSON missing non-empty 'cells' array")
+    name = obj.get("name") or os.path.splitext(os.path.basename(path))[0]
+    r = float(obj.get("r", 1.0))
+    cells = obj.get("cells") or obj.get("container") or obj.get("valid_cells")
+    if not cells:
+        raise ValueError("Container JSON missing 'cells' array")
 
-    S: Set[Tuple[int,int,int]] = set()
-    imin = jmin = kmin = +10**9
-    imax = jmax = kmax = -10**9
-    for c in cells:
-        if not (isinstance(c, (list, tuple)) and len(c) == 3):
+    valid_set = set()
+    for t in cells:
+        if not (isinstance(t, (list, tuple)) and len(t) == 3):
             continue
-        i, j, k = int(c[0]), int(c[1]), int(c[2])
-        S.add((i, j, k))
-        if i < imin: imin = i
-        if i > imax: imax = i
-        if j < jmin: jmin = j
-        if j > jmax: jmax = j
-        if k < kmin: kmin = k
-        if k > kmax: kmax = k
+        i, j, k = int(t[0]), int(t[1]), int(t[2])
+        valid_set.add((i, j, k))
 
-    if not S:
-        raise ValueError("Container cells parsed to empty set")
+    pres = obj.get("presentation")  # optional, carried through to JSON if present
+    return valid_set, r, name, pres
 
-    r = float(data.get("r", data.get("radius", 1.0)))
-    presentation = data.get("presentation", {})
-    return S, (imin, imax, jmin, jmax, kmin, kmax), r, presentation
+# --- Pieces loader (.py with PIECES dict) --------------------------------------------------------
+def load_pieces(py_path:str):
+    py_path = os.path.normpath(py_path)
+    if not os.path.isfile(py_path):
+        raise IOError("File not found: {}".format(py_path))
+    modname = "__pieces__"
+    if modname in sys.modules:
+        del sys.modules[modname]
+    spec = importlib.util.spec_from_file_location(modname, py_path)
+    mod = importlib.util.module_from_spec(spec)
+    assert spec.loader is not None
+    spec.loader.exec_module(mod)
+    if not hasattr(mod, "PIECES"):
+        raise ValueError("pieces module missing PIECES dict")
+    # Normalize to {str -> tuple[tuple[(dx,dy,dz),...], ...]}
+    out = {}
+    for k, oris in mod.PIECES.items():
+        key = str(k)
+        norm_oris = []
+        for ori in oris:
+            norm_oris.append(tuple((int(a), int(b), int(c)) for (a,b,c) in ori))
+        out[key] = tuple(norm_oris)
+    return out
 
-
-# ---------------------------------------------------------------------
-# World-view layer formatter (letters by piece)
-# World axes (u,v,w) where:
-#   u = j + k  (x index)
-#   v = i + k  (y index)
-#   w = i + j  (z index / layer)
-# ---------------------------------------------------------------------
-def format_world_layers(valid_set: Set[Tuple[int,int,int]],
-                        placements: List[dict],
-                        empty_char: str = ".") -> str:
-    # bounds + mapping
+# --- World layer printer (letters) ---------------------------------------------------------------
+def format_world_layers(valid_set:set[tuple[int,int,int]], letter_at:dict, empty_char:str="."):
+    """
+    World view: u=x=j+k (cols), v=y=i+k (rows), w=z=i+j (layers)
+    Only prints cells in valid_set; fills with piece letter or empty_char.
+    """
+    # Bounds in (u,v,w)
     umin = vmin = wmin = +10**9
     umax = vmax = wmax = -10**9
-    uvw_to_ijk: Dict[Tuple[int,int,int], Tuple[int,int,int]] = {}
-    for (i, j, k) in valid_set:
+    uvw_to_ijk = {}
+    for (i,j,k) in valid_set:
         u = j + k
         v = i + k
         w = i + j
@@ -118,21 +137,15 @@ def format_world_layers(valid_set: Set[Tuple[int,int,int]],
         if v > vmax: vmax = v
         if w < wmin: wmin = w
         if w > wmax: wmax = w
-        uvw_to_ijk[(u, v, w)] = (i, j, k)
-
-    # letter map from placements
-    letter_at: Dict[Tuple[int,int,int], str] = {}
-    for pl in placements:
-        piece = str(pl["piece"])
-        for c in pl["cells"]:
-            letter_at[tuple(c)] = piece
+        uvw_to_ijk[(u,v,w)] = (i,j,k)
 
     lines = []
-    lines.append("[SOLUTION — world view]")
-    lines.append(f"Legend: rows=y (i+k: {vmin}..{vmax}), cols=x (j+k: {umin}..{umax}), layers=z (i+j: {wmin}..{wmax})")
+    lines.append("[SOLUTION — world FCC view]")
+    lines.append("Legend: rows=y (i+k: {}..{}), cols=x (j+k: {}..{}), layers=z (i+j: {}..{})"
+                 .format(vmin, vmax, umin, umax, wmin, wmax))
     lines.append("")
     for w in range(wmin, wmax + 1):
-        lines.append(f"Layer z=i+j={w}:")
+        lines.append("Layer z=i+j={}:".format(w))
         for v in range(vmin, vmax + 1):
             row = []
             for u in range(umin, umax + 1):
@@ -145,273 +158,222 @@ def format_world_layers(valid_set: Set[Tuple[int,int,int]],
         lines.append("")
     return "\n".join(lines)
 
+# --- Final JSON writer (match example structure) -------------------------------------------------
+def container_hash(valid_set:set[tuple[int,int,int]]):
+    s = json.dumps(sorted(list(valid_set)), separators=(",",":"))
+    return hashlib.md5(s.encode("utf-8")).hexdigest()
 
-# ---------------------------------------------------------------------
-# Snapshot writer (world.json + layout.txt)
-# ---------------------------------------------------------------------
-def ensure_dir(p: str) -> None:
-    if not os.path.isdir(p):
-        os.makedirs(p)
+def placements_to_json(eng, r:float, container_name:str, presentation):
+    """
+    Build JSON object matching the example:
+    {
+      "version": 1,
+      "container_name": "...",
+      "lattice": "fcc",
+      "r": 1.0,
+      "container_hash": "...",
+      "pieces": [
+        {"id":"A","world_centers":[[x,y,z], ...]},
+        ...
+      ],
+      "presentation": {...}  # optional passthrough if provided
+    }
+    """
+    piece_cells = defaultdict(list)
+    for pl in getattr(eng, "placements", []):
+        pid = str(pl.get("piece") or pl.get("id"))
+        if "cells" in pl:
+            ijks = [tuple(map(int, c)) for c in pl["cells"]]
+        elif "cells_idx" in pl and hasattr(eng, "idx2cell"):
+            ijks = [tuple(map(int, eng.idx2cell[idx])) for idx in pl["cells_idx"]]
+        else:
+            continue
+        for (i,j,k) in ijks:
+            piece_cells[pid].append((i,j,k))
 
-def _idx_to_cell(eng: SolverEngine, idx: int):
-    if hasattr(eng, "idx2cell"):
-        return eng.idx2cell[idx]
-    if hasattr(eng, "index_to_cell"):
-        return eng.index_to_cell(idx)  # type: ignore
-    raise AttributeError("SolverEngine missing idx2cell mapping")
+    pieces_out = []
+    for pid in sorted(piece_cells.keys()):
+        centers = [fcc_point(i,j,k,r) for (i,j,k) in piece_cells[pid]]
+        pieces_out.append({"id": pid, "world_centers": centers})
 
-def _norm_cells_for_pl(eng: SolverEngine, pl: dict):
-    if "cells" in pl:
-        return [tuple(map(int, c)) for c in pl["cells"]]
-    if "cells_idx" in pl:
-        return [tuple(map(int, _idx_to_cell(eng, ii))) for ii in pl["cells_idx"]]
-    return []
+    obj = {
+        "version": 1,
+        "container_name": str(container_name),
+        "lattice": "fcc",
+        "r": float(r),
+        "container_hash": container_hash(getattr(eng, "valid_set", set())),
+        "pieces": pieces_out,
+    }
+    if presentation is not None:
+        obj["presentation"] = presentation
+    return obj
 
-def write_snapshot(out_root: str,
-                   snapshot_index: int,
-                   meta: dict,
-                   eng: SolverEngine,
-                   valid_set: Set[Tuple[int,int,int]],
-                   write_layout: bool = True) -> None:
-    sol_dir = os.path.join(out_root, "solutions")
-    ensure_dir(sol_dir)
-
-    seq = snapshot_index + 1
-    base = f"solution_{seq:04d}"
-
-    # placements normalized to cells
-    pl_out = []
-    for pl in eng.placements:
-        cells = _norm_cells_for_pl(eng, pl)
-        pl_out.append({"piece": pl.get("piece"), "cells": cells})
-
-    world_json = {"meta": meta, "r": meta.get("r"), "placements": pl_out}
-
-    world_path = os.path.join(sol_dir, f"{base}.world.json")
-    with open(world_path, "w") as f:
-        json.dump(world_json, f, indent=2)
-    print(f"[write] depth={eng.cursor:02d} file={os.path.basename(world_path)}")
-
-    if write_layout:
-        txt_path = os.path.join(sol_dir, f"{base}.layout.txt")
-        txt = format_world_layers(valid_set, pl_out, empty_char=".")
-        with open(txt_path, "w") as f:
-            f.write(txt)
-
-
-# ---------------------------------------------------------------------
-# Status printing (correct attempts/sec via monotonic window)
-# ---------------------------------------------------------------------
-def _top_transition_str(eng: SolverEngine) -> str:
-    trans = getattr(eng, "transitions", {})
-    if not trans:
-        return "n/a"
+# --- Status printing -----------------------------------------------------------------------------
+def _fmt_int(n:int): 
     try:
-        (a, b), cnt = max(trans.items(), key=lambda kv: kv[1])
-        return f"{a}→{b}: {cnt}"
+        return "{:,}".format(int(n))
     except Exception:
-        return "n/a"
+        return str(n)
 
-def print_status(eng: SolverEngine, start_wall: float, meter: dict) -> None:
-    now_mono = time.monotonic()
-    da = eng.attempts - meter["last_attempts"]
-    dt = max(1e-9, now_mono - meter["last_t"])
-    rate = da / dt
-    elapsed = time.time() - start_wall
+def print_status(eng, t0, last_attempts, last_time):
+    now = time.time()
+    elapsed = now - t0
+    attempts = getattr(eng, "attempts", 0)
+    d_attempts = max(0, attempts - last_attempts)
+    dt = max(1e-6, now - last_time)
+    rate = d_attempts / dt
 
-    best_ever = getattr(eng, "best_depth_ever", eng.cursor)
+    placed = len(getattr(eng, "placements", []))
+    total = len(getattr(eng, "order", ()))
+    best_ever = getattr(eng, "best_depth_ever", None)
+    best = best_ever if isinstance(best_ever, int) and best_ever >= placed else placed
 
-    print(f"[rev13.2] Placed {eng.cursor} / {len(eng.order)} pieces "
-          f"({(100.0*eng.cursor/len(eng.order)):.1f}%) | "
-          f"Best depth (ever): {best_ever} | "
-          f"Rate: {rate:,.0f} attempts/s | elapsed: {elapsed:.1f}s")
+    print(f"[rev13.2] Placed {placed} / {total} pieces ({(100.0*placed/total if total else 0.0):.1f}%) | "
+          f"Best depth (ever): {best} | Rate: {_fmt_int(rate)} attempts/s | elapsed: {elapsed:.1f}s")
 
+    tt_size = len(getattr(eng, "TT", {})) if hasattr(eng, "TT") else 0
     tt_hits = getattr(eng, "tt_hits", 0)
     tt_prunes = getattr(eng, "tt_prunes", 0)
-    forced_singletons = getattr(eng, "forced_singletons", 0)
+    forced = getattr(eng, "forced_singletons", 0)
+    in_corridor = getattr(eng, "in_corridor", False)
     deg2 = getattr(eng, "deg2_corridor", False)
+    cap = getattr(eng, "branch_cap_cur", None)
+    roulette = getattr(eng, "roulette_cur", "none")
 
-    print(f"   anchors: {len(getattr(eng, 'anchor_seen', []))} unique | "
-          f"transitions: {len(getattr(eng, 'transitions', {}))} unique "
-          f"(top {_top_transition_str(eng)}) | "
-          f"TT: size={len(getattr(eng, 'TT', {}))} hits={tt_hits} prunes={tt_prunes} | "
-          f"forced-singletons={forced_singletons}")
-    print(f"   search mode: {getattr(eng, 'roulette_mode', 'none')} | "
-          f"branch cap: {getattr(eng, 'branch_cap_cur', '-') } "
-          f"(corridor={getattr(eng, 'in_corridor', False)} deg2={deg2})")
+    anchor_seen = getattr(eng, "anchor_seen", set())
+    transitions = getattr(eng, "transitions", {})
+    top_trans = "n/a"
+    if transitions:
+        (a,b), cnt = max(transitions.items(), key=lambda kv: kv[1])
+        top_trans = f"{a}→{b}: {cnt}"
 
-    if getattr(eng, "stat_choices_hist", None):
-        parts = ", ".join(f"{k}: {v}" for k, v in sorted(eng.stat_choices_hist.items()))
-        print("   choices@depth histogram (post-cap): " + parts)
+    print(f"   anchors: {len(anchor_seen)} unique | transitions: {len(transitions)} unique (top {top_trans}) | "
+          f"TT: size={_fmt_int(tt_size)} hits={_fmt_int(tt_hits)} prunes={_fmt_int(tt_prunes)} | forced-singletons={_fmt_int(forced)}")
+    print(f"   search mode: {roulette} | branch cap: {cap} (corridor={in_corridor} deg2={deg2})")
 
-    if getattr(eng, "stat_exposure_hist", None):
-        keys = sorted(eng.stat_exposure_hist)[:12]
-        print("   exposure buckets (low=better): " +
-              ", ".join(f"{k}: {eng.stat_exposure_hist[k]:,}" for k in keys))
+    def head_hist(d:dict, label:str, limit:int=12):
+        if not d:
+            return
+        keys = sorted(d.keys())
+        parts = []
+        for k in keys[:limit]:
+            parts.append(f"{k}: {_fmt_int(d[k])}")
+        print(f"   {label}: " + ", ".join(parts))
 
-    if getattr(eng, "stat_boundary_exposure_hist", None):
-        keys = sorted(eng.stat_boundary_exposure_hist)[:12]
-        print("   boundary-exposure (low=better): " +
-              ", ".join(f"{k}: {eng.stat_boundary_exposure_hist[k]:,}" for k in keys))
+    head_hist(getattr(eng, "stat_choices_hist", {}), "choices@depth histogram (post-cap)")
+    head_hist(getattr(eng, "stat_exposure_hist", {}), "exposure buckets (low=better)")
+    head_hist(getattr(eng, "stat_boundary_exposure_hist", {}), "boundary-exposure (low=better)")
+    head_hist(getattr(eng, "stat_leaf_hist", {}), "leaf-empties (lower=better)")
 
-    if getattr(eng, "stat_leaf_hist", None):
-        keys = sorted(eng.stat_leaf_hist)[:12]
-        print("   leaf-empties (lower=better): " +
-              ", ".join(f"{k}: {eng.stat_leaf_hist[k]:,}" for k in keys))
+    if hasattr(eng, "stat_anchor_deg_hist"):
+        deg_parts = []
+        for k in sorted(eng.stat_anchor_deg_hist.keys()):
+            deg_parts.append(f"{k}: {_fmt_int(eng.stat_anchor_deg_hist[k])}")
+        if deg_parts:
+            print("   anchor empty-neighbor degree: " + " | ".join(deg_parts))
 
-    if getattr(eng, "stat_anchor_deg_hist", None):
-        parts = " | ".join(f"{k}: {v}" for k, v in sorted(eng.stat_anchor_deg_hist.items()))
-        print("   anchor empty-neighbor degree: " + parts)
-
-    if getattr(eng, "stat_fallback_piece", None):
+    if hasattr(eng, "stat_fallback_piece") and eng.stat_fallback_piece:
         top_fb = sorted(eng.stat_fallback_piece.items(), key=lambda kv: -kv[1])[:8]
-        print("   pieces needing fallback origins most: " +
-              ", ".join(f"{k}: {v}" for k, v in top_fb))
+        head = ", ".join(f"{k}: {_fmt_int(v)}" for k, v in top_fb)
+        print("   pieces needing fallback origins most: " + head)
 
-    meter["last_t"] = now_mono
-    meter["last_attempts"] = eng.attempts
+    return attempts, now
 
-
-# ---------------------------------------------------------------------
-# Argparse
-# ---------------------------------------------------------------------
-def build_argparser() -> argparse.ArgumentParser:
-    p = argparse.ArgumentParser()
-    p.add_argument("--container", required=True, help="Path to container JSON")
-    p.add_argument("--pieces", required=True, help="Path to pieces.py (PIECES dict)")
-    p.add_argument("--out", required=True, help="Output folder (will create solutions/ inside)")
-    p.add_argument("--present", choices=["auto", "none"], default="auto",
-                   help="Write presentation block from container JSON into snapshots (default auto)")
-    p.add_argument("--status-interval", type=float, default=5.0,
-                   help="Seconds between status prints (0 to disable)")
-    p.add_argument("--snap", choices=["depth", "solved", "none"], default="depth",
-                   help="When to write snapshots (default depth)")
-
-    # Tunables / runtime
-    p.add_argument("--branch-cap-open", type=int, default=None, help="Open region branch cap")
-    p.add_argument("--branch-cap-tight", type=int, default=None, help="Corridor branch cap")
-    p.add_argument("--deg2-corridor", type=int, default=None, help="Enable corridor on degree-2 empties (0/1)")
-    p.add_argument("--roulette", choices=["least-tried", "none"], default=None, help="Roulette mode")
-    p.add_argument("--tt-max", type=int, default=None, help="Transposition table max entries")
-    p.add_argument("--tt-trim-keep", type=int, default=None, help="TT keep entries on trim")
-    p.add_argument("--stagnation-seconds", type=float, default=None, help="Warn if no depth gain for N seconds")
-    p.add_argument("--restart-limit", type=int, default=None, help="(Reserved) max restarts on stagnation")
-    return p
-
-
-# ---------------------------------------------------------------------
-# Main
-# ---------------------------------------------------------------------
+# --- Main ----------------------------------------------------------------------------------------
 def main():
-    args = build_argparser().parse_args()
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--container", required=True, help="Path to container JSON")
+    ap.add_argument("--pieces", required=True, help="Path to pieces.py")
+    ap.add_argument("--out", required=True, help="Output folder (created if not exists)")
+    ap.add_argument("--present", choices=["auto","none"], default="auto", help="(compat only; not used)")
+    ap.add_argument("--status-interval", type=float, default=5.0, help="Seconds between status prints (0 disables)")
+    ap.add_argument("--max-seconds", type=float, default=0.0, help="Stop after this many seconds (0 = no limit)")
+    ap.add_argument("--max-attempts", type=int, default=0, help="Stop after this many attempts (0 = no limit)")
+    # optional tuning knobs (applied if engine exposes attributes)
+    ap.add_argument("--branch-cap-open", type=int, default=None)
+    ap.add_argument("--branch-cap-tight", type=int, default=None)
+    ap.add_argument("--deg2-corridor", type=int, choices=[0,1], default=None)
+    ap.add_argument("--roulette", choices=["least-tried","none"], default=None)
+    ap.add_argument("--tt-max", type=int, default=None)
+    ap.add_argument("--tt-trim-keep", type=int, default=None)
+    args = ap.parse_args()
 
-    out_root = os.path.abspath(args.out)
-    ensure_dir(out_root)
-    ensure_dir(os.path.join(out_root, "solutions"))
+    os.makedirs(args.out, exist_ok=True)
 
-    valid_set, bbox, r_in, presentation = load_container_json(args.container)
-    if args.present == "none":
-        presentation = {}
-
+    valid_set, r, container_name, presentation = load_container_json(args.container)
     pieces = load_pieces(args.pieces)
 
-    # --- Engine: do NOT pass presentation; your SolverEngine doesn't accept it ---
+    # Build engine
     eng = SolverEngine(pieces=pieces, valid_set=valid_set)
 
-    # Optional display-only best depth
-    eng.best_depth_ever = getattr(eng, "best_depth_ever", 0)
+    # Apply knobs if available
+    applied = []
+    if args.branch_cap_open is not None and hasattr(eng, "BRANCH_CAP_OPEN"):
+        eng.BRANCH_CAP_OPEN = int(args.branch_cap_open); applied.append(f"branch_cap_open={eng.BRANCH_CAP_OPEN}")
+    if args.branch_cap_tight is not None and hasattr(eng, "BRANCH_CAP_TIGHT"):
+        eng.BRANCH_CAP_TIGHT = int(args.branch_cap_tight); applied.append(f"branch_cap_tight={eng.BRANCH_CAP_TIGHT}")
+    if args.deg2_corridor is not None and hasattr(eng, "deg2_corridor"):
+        eng.deg2_corridor = bool(args.deg2_corridor); applied.append(f"deg2_corridor={eng.deg2_corridor}")
+    if args.roulette is not None and hasattr(eng, "ROULETTE_MODE"):
+        eng.ROULETTE_MODE = args.roulette; applied.append(f"roulette={eng.ROULETTE_MODE}")
+    if args.tt_max is not None and hasattr(eng, "TT_MAX"):
+        eng.TT_MAX = int(args.tt_max); applied.append(f"tt_max={eng.TT_MAX}")
+    if args.tt_trim_keep is not None and hasattr(eng, "TT_TRIM_KEEP"):
+        eng.TT_TRIM_KEEP = int(args.tt_trim_keep); applied.append(f"tt_trim_keep={eng.TT_TRIM_KEEP}")
+    if applied:
+        print("[tuning] " + ", ".join(applied))
 
-    # Apply tunables if engine exposes them
-    def maybe_set(obj, name, value):
-        if value is None:
-            return
-        if hasattr(obj, name):
-            setattr(obj, name, value)
+    # Run loop
+    start = time.time()
+    last_status = start
+    last_attempts = getattr(eng, "attempts", 0)
+    last_time = start
 
-    maybe_set(eng, "branch_cap_open", args.branch_cap_open)
-    maybe_set(eng, "branch_cap_tight", args.branch_cap_tight)
-    if args.deg2_corridor is not None:
-        maybe_set(eng, "deg2_corridor", bool(args.deg2_corridor))
-    if args.roulette is not None:
-        maybe_set(eng, "roulette_mode", args.roulette)
-    maybe_set(eng, "TT_MAX", args.tt_max)
-    maybe_set(eng, "TT_TRIM_KEEP", args.tt_trim_keep)
-    maybe_set(eng, "stagnation_seconds", args.stagnation_seconds)
-    maybe_set(eng, "restart_limit", args.restart_limit)
-
-    # Meta base (written into snapshots)
-    meta_base = {
-        "container_bbox": list(bbox),
-        "r": r_in,
-        "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
-        "present": presentation,
-        "tunables": {
-            "branch_cap_open": getattr(eng, "branch_cap_open", None),
-            "branch_cap_tight": getattr(eng, "branch_cap_tight", None),
-            "deg2_corridor": getattr(eng, "deg2_corridor", False),
-            "roulette": getattr(eng, "roulette_mode", "none"),
-            "TT_MAX": getattr(eng, "TT_MAX", None),
-            "TT_TRIM_KEEP": getattr(eng, "TT_TRIM_KEEP", None),
-        }
-    }
-
-    # Status meter baseline (monotonic)
-    status_meter = {"last_t": time.monotonic(), "last_attempts": 0}
-    last_status_t = time.monotonic()
-
-    # Stagnation tracking (optional warn)
-    stagnant_since = time.monotonic()
-
-    # Snapshot control
-    snap_mode = args.snap
-    last_depth_written = -1
-    snap_idx = 0
-
-    # Main loop
-    start_wall = time.time()
-    solved_printed = False
-
+    solved = False
     while True:
         progressed, solved = eng.step_once()
-
-        if eng.cursor > eng.best_depth_ever:
-            eng.best_depth_ever = eng.cursor
-            stagnant_since = time.monotonic()
-
-        if snap_mode == "depth" and eng.cursor > last_depth_written:
-            meta = dict(meta_base)
-            meta.update({"depth": eng.cursor, "solved": bool(solved)})
-            write_snapshot(out_root, snap_idx, meta, eng, valid_set, write_layout=True)
-            snap_idx += 1
-            last_depth_written = eng.cursor
-
         if solved:
-            if snap_mode in ("depth", "solved") and last_depth_written != eng.cursor:
-                meta = dict(meta_base)
-                meta.update({"depth": eng.cursor, "solved": True})
-                write_snapshot(out_root, snap_idx, meta, eng, valid_set, write_layout=True)
-                snap_idx += 1
-                last_depth_written = eng.cursor
-            if not solved_printed:
-                print("[solved]")
-                solved_printed = True
             break
+        if args.max_seconds and (time.time() - start) >= args.max_seconds:
+            break
+        if args.max_attempts and getattr(eng, "attempts", 0) >= args.max_attempts:
+            break
+        if args.status_interval > 0.0:
+            now = time.time()
+            if now - last_status >= args.status_interval:
+                last_attempts, last_time = print_status(eng, start, last_attempts, last_time)
+                last_status = now
 
-        if args.status_interval and args.status_interval > 0.0:
-            now = time.monotonic()
-            if now - last_status_t >= args.status_interval:
-                print_status(eng, start_wall, status_meter)
-                last_status_t = now
+    # Final status and write
+    print_status(eng, start, last_attempts, last_time)
 
-        if args.stagnation_seconds and args.stagnation_seconds > 0:
-            if time.monotonic() - stagnant_since >= args.stagnation_seconds:
-                print(f"[warn] No depth improvement for {args.stagnation_seconds:.0f}s "
-                      f"(best depth so far: {eng.best_depth_ever})")
-                stagnant_since = time.monotonic()
+    # Build letter map and write world-layers TXT
+    letter_at = {}
+    for pl in getattr(eng, "placements", []):
+        pid = str(pl.get("piece") or pl.get("id"))
+        if "cells" in pl:
+            ijks = [tuple(map(int, c)) for c in pl["cells"]]
+        elif "cells_idx" in pl and hasattr(eng, "idx2cell"):
+            ijks = [tuple(map(int, eng.idx2cell[idx])) for idx in pl["cells_idx"]]
+        else:
+            ijks = []
+        for c in ijks:
+            letter_at[c] = pid
 
-    # Final status with accurate instantaneous rate
-    print_status(eng, start_wall, status_meter)
+    txt = format_world_layers(valid_set, letter_at, empty_char=".")
+    txt_path = os.path.join(args.out, f"{container_name}_solution.world_layers.txt")
+    with open(txt_path, "w") as f:
+        f.write(txt)
 
+    # JSON (match example)
+    sol_obj = placements_to_json(eng, r=r, container_name=container_name, presentation=presentation)
+    json_path = os.path.join(args.out, f"{container_name}_solution.world.json")
+    with open(json_path, "w") as f:
+        json.dump(sol_obj, f, indent=2)
+
+    print("[done]")
+    print("  " + json_path)
+    print("  " + txt_path)
 
 if __name__ == "__main__":
     main()

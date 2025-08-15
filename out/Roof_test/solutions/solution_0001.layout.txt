@@ -1,0 +1,9 @@
+[SOLUTION — square view]
+
+Legend: rows=v (6..10), cols=u (-1..6)
+
+V W X Y Y V R N
+V W X Y U R N J
+V X Y U Q M J G
+W X T P M I F D
+W S O L H E C B

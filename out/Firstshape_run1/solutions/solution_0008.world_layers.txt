@@ -1,0 +1,52 @@
+[SOLUTION — world view]
+Legend: rows=y (i+k: 0..7), cols=x (j+k: 0..4), layers=z (i+j: 0..4)
+
+Layer z=i+j=0:
+.   .   G
+  .   .
+.   .   .
+  .   .
+.   .   .
+  E   .
+D   .   .
+  .   H
+
+Layer z=i+j=1:
+  .   .
+.   .   G
+  .   .
+.   .   G
+  .   .
+E   .   .
+  D   .
+.   .   H
+
+Layer z=i+j=2:
+.   .   I
+  .   .
+.   .   G
+  .   .
+.   .   .
+  .   .
+E   D   .
+  C   H
+
+Layer z=i+j=3:
+  .   .
+.   .   I
+  .   .
+.   .   F
+  .   F
+C   .   J
+  C   D
+E   J   H
+
+Layer z=i+j=4:
+.   .   I
+  .   .
+.   .   I
+  .   .
+C   .   F
+  A   F
+A   A   J
+  A   J

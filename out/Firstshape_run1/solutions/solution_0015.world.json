@@ -9,15 +9,15 @@
       5
     ],
     "r": 0.5,
-    "timestamp": "2025-08-15 06:54:14",
+    "timestamp": "2025-08-15 07:40:38",
     "present": {},
     "tunables": {
       "branch_cap_open": null,
       "branch_cap_tight": null,
       "deg2_corridor": false,
       "roulette": "none",
-      "TT_MAX": 3000000,
-      "TT_TRIM_KEEP": 2000000
+      "TT_MAX": 1200000,
+      "TT_TRIM_KEEP": 800000
     },
     "depth": 16,
     "solved": false

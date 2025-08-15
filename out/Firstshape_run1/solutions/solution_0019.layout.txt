@@ -2,20 +2,20 @@
 Legend: rows=y (i+k: 0..7), cols=x (j+k: 0..4), layers=z (i+j: 0..4)
 
 Layer z=i+j=0:
-M   T   G
-  T   W
-N   T   W
+.   N   G
+  .   W
+.   N   W
   U   L
-N   L   L
+.   L   L
   E   B
 D   .   Y
   .   H
 
 Layer z=i+j=1:
   .   W
-M   .   G
-  M   .
-N   T   G
+.   N   G
+  .   .
+.   T   G
   U   L
 E   .   Y
   D   B
@@ -23,9 +23,9 @@ E   .   Y
 
 Layer z=i+j=2:
 .   W   I
-  M   .
-.   .   G
-  N   .
+  M   N
+T   .   G
+  T   T
 U   .   Y
   X   Y
 E   D   B
@@ -33,8 +33,8 @@ E   D   B
 
 Layer z=i+j=3:
   .   K
-.   K   I
-  .   V
+M   K   I
+  M   V
 U   V   F
   X   F
 C   .   J
@@ -44,7 +44,7 @@ E   J   H
 Layer z=i+j=4:
 .   K   I
   .   K
-V   .   I
+V   M   I
   V   X
 C   X   F
   A   F

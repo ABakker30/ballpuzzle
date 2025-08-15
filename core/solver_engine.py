@@ -1,34 +1,37 @@
-# solver/core/solver_engine.py
-# FCC tetra-spheres solver engine — rev13.2+mod4
-# (bitmask + precomputed fits, local pruning, dynamic branch-cap, forced-singletons,
-#  exposure+boundary+leaf heuristic, least-tried roulette with corridor lockout,
-#  bounded TT, optional deg2-corridor; ADDED: local component mod-4 cavity prune)
+# core/solver_engine.py
+# FCC tetra-spheres solver engine — rev13.2 (standalone port from GH)
+# Features: bitmask + precomputed fits, local pruning, dynamic branch-cap,
+# forced-singletons, exposure+boundary+leaf heuristic, least-tried roulette
+# with corridor lockout, bounded TT, deg2-corridor toggle.
+#
+# This file intentionally does NOT depend on Rhino/GH. It operates purely on
+# integer FCC lattice coordinates (i, j, k).
 
-import math, random, time
+from __future__ import annotations
+import math
+import random
+import time
 from collections import deque, defaultdict
+from typing import Dict, Tuple, List, Set, Optional
 
 # --------------------------
-# Tunables (rev13.2 + tweaks)
+# Tunables (defaults; can be tweaked by caller after construction)
 # --------------------------
-BRANCH_CAP_OPEN   = 18            # open regions
-BRANCH_CAP_TIGHT  = 12            # was 10; slightly wider in corridors to reduce overcommit
-ROULETTE_MODE     = "least-tried" # "least-tried" or "none" (auto-disabled in corridor)
-RNG_SEED_DEFAULT  = 1337          # fixed seed for reproducibility
+DEFAULT_BRANCH_CAP_OPEN   = 18            # open regions
+DEFAULT_BRANCH_CAP_TIGHT  = 10            # degree-1 corridors
+DEFAULT_ROULETTE_MODE     = "least-tried" # "least-tried" or "none"
+DEFAULT_RNG_SEED          = 1337
+DEFAULT_TT_MAX            = 1_200_000
+DEFAULT_TT_TRIM_KEEP      = 800_000
 
-# Larger TT so long runs breathe better
-TT_MAX            = 3_000_000     # was 1_200_000
-TT_TRIM_KEEP      = 2_000_000     # was 800_000
+# Heuristic weights (rev13.2)
+DEFAULT_EXPOSURE_WEIGHT          = 1.0
+DEFAULT_BOUNDARY_EXPOSURE_WEIGHT = 0.8
+DEFAULT_LEAF_WEIGHT              = 0.8
 
-# Heuristic weights (slightly rebalanced for shells)
-EXPOSURE_WEIGHT           = 1.0
-BOUNDARY_EXPOSURE_WEIGHT  = 0.5   # was 0.8
-LEAF_WEIGHT               = 1.3   # was 0.8
+# Corridor gating (rev13.2)
+DEFAULT_DEG2_CORRIDOR = False  # keep degree-2 corridors OFF unless explicitly enabled
 
-# Corridor gating
-DEG2_CORRIDOR_DEFAULT     = False # keep degree-2 corridors OFF by default
-
-# New prune
-COMPONENT_MOD4_PRUNE      = True  # prune any empty component with size % 4 != 0
 
 # FCC adjacency (12-neighbor)
 _NEIGH = (
@@ -36,98 +39,87 @@ _NEIGH = (
     (1,-1,0),(-1,1,0),(1,0,-1),(-1,0,1),(0,1,-1),(0,-1,1)
 )
 
-# Preferred piece order (kept as in rev13.2)
+# Preferred piece order bias (rev13.2)
 _ORDER_PREF = (
     "A","C","E","G","I","J","H","F","D","B","Y",
-    # 3D shell struts/corners & connectors
     "X","W","L","K","V","U","T",
     "N","M",
     "S","R","Q","P","O"
 )
 
-# --------------------------
-# Helpers
-# --------------------------
-def popcount(x):
-    return x.bit_count() if hasattr(int, "bit_count") else bin(x).count("1")
 
-def _pick_order(pieces):
-    keys = set(pieces.keys())
-    ordered = [k for k in _ORDER_PREF if k in keys]
-    remaining = sorted(keys.difference(_ORDER_PREF))
-    return tuple(ordered + remaining)
-
-# --------------------------
-# Engine
-# --------------------------
-class SolverEngine(object):
+class SolverEngine:
     """
-    Standalone solver engine (no Rhino/GH deps). Mirrored from rev13.2 with:
-      - Optional component-size %4 prune (local to touched empties)
-      - Slightly wider tight branch cap
-      - Larger bounded TT
-      - Heuristic reweighting for shell-heavy containers
+    Stateless inputs:
+      - pieces: dict[str, tuple[tuple[(dx,dy,dz), ...], ...]]  (orientations per piece)
+      - valid_set: set[(i,j,k)]                                (container cells)
+
+    Maintains search state and stats during run.
     """
 
+    # --------------------------
+    # Construction
+    # --------------------------
     def __init__(self,
-                 valid_set,
-                 pieces,
-                 *,
-                 rng_seed=RNG_SEED_DEFAULT,
-                 branch_cap_open=BRANCH_CAP_OPEN,
-                 branch_cap_tight=BRANCH_CAP_TIGHT,
-                 roulette_mode=ROULETTE_MODE,
-                 tt_max=TT_MAX,
-                 tt_trim_keep=TT_TRIM_KEEP,
-                 exposure_weight=EXPOSURE_WEIGHT,
-                 boundary_exposure_weight=BOUNDARY_EXPOSURE_WEIGHT,
-                 leaf_weight=LEAF_WEIGHT,
-                 deg2_corridor=DEG2_CORRIDOR_DEFAULT,
-                 component_mod4_prune=COMPONENT_MOD4_PRUNE):
-        """
-        valid_set: set of (i,j,k) ints for container cells
-        pieces: dict[str] -> tuple[orientation], each orientation = tuple[(di,dj,dz)...] length 4
-        """
-
+                 pieces: Dict[str, Tuple[Tuple[Tuple[int,int,int], ...], ...]],
+                 valid_set: Set[Tuple[int,int,int]]):
+        # Inputs
+        self.pieces = self._normalize_pieces(pieces)
         self.valid_set = set(valid_set)
-        self.idx2cell, self.cell2idx, self.neighbors, self.is_boundary = self._build_grid(self.valid_set)
-        self.pieces = pieces
-        self.order = _pick_order(pieces)
-        self.fits = self._precompute_fits(pieces, self.valid_set, self.cell2idx)
 
-        # Config
-        self.RNG_SEED = int(rng_seed)
-        self.BRANCH_CAP_OPEN = int(branch_cap_open)
-        self.BRANCH_CAP_TIGHT = int(branch_cap_tight)
-        self.ROULETTE_MODE = str(roulette_mode)
-        self.TT_MAX = int(tt_max)
-        self.TT_TRIM_KEEP = int(tt_trim_keep)
-        self.EXPOSURE_WEIGHT = float(exposure_weight)
-        self.BOUNDARY_EXPOSURE_WEIGHT = float(boundary_exposure_weight)
-        self.LEAF_WEIGHT = float(leaf_weight)
-        self.deg2_corridor = bool(deg2_corridor)
-        self.COMPONENT_MOD4_PRUNE = bool(component_mod4_prune)
+        # Tunables (mutable; caller may update after construct)
+        self.RNG_SEED          = DEFAULT_RNG_SEED
+        self.BRANCH_CAP_OPEN   = DEFAULT_BRANCH_CAP_OPEN
+        self.BRANCH_CAP_TIGHT  = DEFAULT_BRANCH_CAP_TIGHT
+        self.ROULETTE_MODE     = DEFAULT_ROULETTE_MODE
+        self.TT_MAX            = DEFAULT_TT_MAX
+        self.TT_TRIM_KEEP      = DEFAULT_TT_TRIM_KEEP
+        self.EXPOSURE_WEIGHT          = DEFAULT_EXPOSURE_WEIGHT
+        self.BOUNDARY_EXPOSURE_WEIGHT = DEFAULT_BOUNDARY_EXPOSURE_WEIGHT
+        self.LEAF_WEIGHT              = DEFAULT_LEAF_WEIGHT
+        self.deg2_corridor     = DEFAULT_DEG2_CORRIDOR
+
+        # Grid
+        (self.idx2cell,
+         self.cell2idx,
+         self.neighbors,
+         self.is_boundary) = self._build_grid(self.valid_set)
+
+        # Precompute
+        self.fits = self._precompute_fits(self.pieces, self.valid_set, self.cell2idx)
+
+        # Order
+        self.order = self._pick_order(self.pieces)
+
+        # TT init
+        random.seed(self.RNG_SEED)
+        N = len(self.idx2cell)
+        self.occ_keys, self.depth_keys = self._init_zobrist(N, len(self.order))
+        self.TT: Dict[int, int] = {}
 
         # State
         self.cursor = 0
         self.occ_bits = 0
-        self.placements = []   # list of dicts (piece, origin_idx, ori_idx, mask, cells_idx, cells)
-        self.frontier = []     # list[deque] per depth
+        self.placements: List[Dict] = []     # each: {"piece", "origin_idx", "ori_idx", "mask", "cells_idx"}
+        self.frontier: List[deque] = []      # per-depth deque of choices
         self.solved = False
         self.dirty = False
 
-        # Stats
+        # Perf counters
         self.attempts = 0
-        self.try_counts = defaultdict(int)     # (piece, origin_idx, ori_idx) -> tries
-        self.anchor_seen = set()
-        self.transitions = defaultdict(int)    # (prev_anchor, cur_anchor) -> count
-        self.last_anchor = None
+        self._t0 = time.time()
 
-        # prune/score stats
+        # Search bookkeeping / stats
+        self.try_counts = defaultdict(int)     # (piece, origin_idx, ori_idx) -> tries
+        self.anchor_seen: Set[int] = set()
+        self.transitions = defaultdict(int)    # (prev_anchor, cur_anchor) -> count
+        self.last_anchor: Optional[int] = None
+
+        # Histograms / counters
         self.stat_pruned_isolated = 0
-        self.stat_pruned_cavity = 0   # reserved
-        self.stat_pruned_mod4 = 0     # NEW
-        self.stat_considered = 0
+        self.stat_pruned_cavity   = 0  # reserved
+        self.stat_considered      = 0
+
         self.stat_exposure_hist = defaultdict(int)
         self.stat_boundary_exposure_hist = defaultdict(int)
         self.stat_leaf_hist = defaultdict(int)
@@ -138,35 +130,49 @@ class SolverEngine(object):
         # forced-singletons
         self.forced_singletons = 0
 
-        # TT
-        N = len(self.idx2cell)
-        self.occ_keys, self.depth_keys = self._init_zobrist(N, len(self.pieces))
-        self.TT = {}
-        self.tt_hits = 0
+        # TT stats
+        self.tt_hits   = 0
         self.tt_prunes = 0
 
-        # runtime toggles
+        # Runtime toggles (updated per-depth)
         self.branch_cap_cur = self.BRANCH_CAP_OPEN
-        self.roulette_cur = self.ROULETTE_MODE
-        self.in_corridor = False
+        self.roulette_cur   = self.ROULETTE_MODE
+        self.in_corridor    = False
 
-    # ---------- Grid & fits ----------
-    def _build_grid(self, valid_set):
+        # Best depth ever (for UX; maintained externally in some setups too)
+        self.best_depth_ever = 0
+
+    # --------------------------
+    # Public helpers
+    # --------------------------
+    def placed_count(self) -> int:
+        return len(self.placements)
+
+    def total_pieces(self) -> int:
+        return len(self.order)
+
+    def elapsed_seconds(self) -> float:
+        return time.time() - self._t0
+
+    # --------------------------
+    # Grid & fits
+    # --------------------------
+    def _build_grid(self, valid_set: Set[Tuple[int,int,int]]):
         idx2cell = list(sorted(valid_set))
         cell2idx = {c: i for i, c in enumerate(idx2cell)}
-        neighbors = []
-        is_boundary = []
+        neighbors: List[Tuple[int, ...]] = []
+        is_boundary: List[bool] = []
         for (i,j,k) in idx2cell:
             lst = []
-            for di,dj,dz in _NEIGH:
-                c = (i+di, j+dj, k+dz)
+            for di,dj,dk in _NEIGH:
+                c = (i+di, j+dj, k+dk)
                 if c in cell2idx:
                     lst.append(cell2idx[c])
             neighbors.append(tuple(lst))
-            # boundary if ANY FCC neighbor falls outside
             on_boundary = False
-            for di,dj,dz in _NEIGH:
-                if (i+di, j+dj, k+dz) not in cell2idx:
+            for di,dj,dk in _NEIGH:
+                c = (i+di, j+dj, k+dk)
+                if c not in cell2idx:
                     on_boundary = True
                     break
             is_boundary.append(on_boundary)
@@ -198,19 +204,67 @@ class SolverEngine(object):
             fits[key] = per_origin
         return fits
 
-    # ---------- Zobrist / TT ----------
-    def _init_zobrist(self, N, depth_cap):
-        rnd = random.Random(self.RNG_SEED ^ 0x9E3779B97F4A7C15)
-        occ_keys = [rnd.getrandbits(64) for _ in range(N)]
-        depth_keys = [rnd.getrandbits(64) for _ in range(depth_cap+1)]
+    # --------------------------
+    # Pieces & order
+    # --------------------------
+    def _normalize_pieces(self, pieces_in):
+        pieces = {}
+        for k, oris in pieces_in.items():
+            norm_oris = []
+            for ori in oris:
+                norm_oris.append(tuple((int(a), int(b), int(c)) for (a,b,c) in ori))
+            pieces[str(k)] = tuple(norm_oris)
+        return pieces
+
+    def _pick_order(self, pieces):
+        keys = set(pieces.keys())
+        ordered = [k for k in _ORDER_PREF if k in keys]
+        remaining = sorted(keys.difference(_ORDER_PREF))
+        return tuple(ordered + remaining)
+
+    # --------------------------
+    # Bit helpers
+    # --------------------------
+    @staticmethod
+    def _is_occupied(bitset: int, idx: int) -> int:
+        return (bitset >> idx) & 1
+
+    # --------------------------
+    # Anchor select
+    # --------------------------
+    def _neighbor_degree(self, idx: int, occ_bits: int) -> int:
+        d = 0
+        for n in self.neighbors[idx]:
+            if not self._is_occupied(occ_bits, n):
+                d += 1
+        return d
+
+    def _select_anchor(self, N: int, occ_bits: int) -> Tuple[Optional[int], Optional[int]]:
+        best = -1
+        best_deg = 10**9
+        for idx in range(N):
+            if not self._is_occupied(occ_bits, idx):
+                deg = self._neighbor_degree(idx, occ_bits)
+                if deg < best_deg or (deg == best_deg and (best < 0 or idx < best)):
+                    best = idx
+                    best_deg = deg
+        return (None, None) if best < 0 else (best, best_deg)
+
+    # --------------------------
+    # Zobrist / TT
+    # --------------------------
+    def _init_zobrist(self, N: int, depth_cap: int):
+        random.seed(self.RNG_SEED ^ 0x9E3779B97F4A7C15)
+        occ_keys = [random.getrandbits(64) for _ in range(N)]
+        depth_keys = [random.getrandbits(64) for _ in range(depth_cap+1)]
         return occ_keys, depth_keys
 
-    def _tt_hash(self, occ_bits, cursor):
+    def _tt_hash(self, occ_bits: int, cursor: int) -> int:
         h = 0
         x = occ_bits
         idx = 0
         while x:
-            if (x & 1) != 0:
+            if x & 1:
                 h ^= self.occ_keys[idx]
             idx += 1
             x >>= 1
@@ -220,7 +274,7 @@ class SolverEngine(object):
             h ^= (cursor * 11400714819323198485) & ((1<<64)-1)
         return h
 
-    def _tt_should_prune(self):
+    def _tt_should_prune(self) -> bool:
         if self.TT is None:
             return False
         h = self._tt_hash(self.occ_bits, self.cursor)
@@ -231,14 +285,13 @@ class SolverEngine(object):
             return True
         return False
 
-    def _tt_record(self):
+    def _tt_record(self) -> None:
         if self.TT is None:
             return
         h = self._tt_hash(self.occ_bits, self.cursor)
         prev = self.TT.get(h)
         if (prev is None) or (self.cursor > prev):
             self.TT[h] = self.cursor
-        # bounded: age/trim if too large
         if len(self.TT) > self.TT_MAX:
             to_drop = len(self.TT) - self.TT_TRIM_KEEP
             for _ in range(to_drop):
@@ -247,34 +300,10 @@ class SolverEngine(object):
                 except StopIteration:
                     break
 
-    # ---------- Degrees / anchor ----------
-    def _is_occupied_bit(self, bitset, idx):
-        return ((bitset >> idx) & 1) != 0
-
-    def _neighbor_degree(self, idx, occ_bits):
-        d = 0
-        for n in self.neighbors[idx]:
-            if ((occ_bits >> n) & 1) == 0:
-                d += 1
-        return d
-
-    def _select_anchor(self):
-        N = len(self.idx2cell)
-        occ = self.occ_bits
-        best = -1
-        best_deg = 10**9
-        for idx in range(N):
-            if ((occ >> idx) & 1) != 0:
-                continue
-            deg = self._neighbor_degree(idx, occ)
-            if deg < best_deg or (deg == best_deg and (best < 0 or idx < best)):
-                best = idx
-                best_deg = deg
-        return (None, None) if best < 0 else (best, best_deg)
-
-    # ---------- Prunes / scoring ----------
-    def _creates_isolated_empty(self, occ_after, touched_idxs):
-        """No empty cell with zero empty neighbors (local check)"""
+    # --------------------------
+    # Pruning helpers
+    # --------------------------
+    def _creates_isolated_empty(self, occ_after: int, touched_idxs: Tuple[int, ...]) -> bool:
         neighbors = self.neighbors
         to_check = set()
         for t in touched_idxs:
@@ -284,47 +313,16 @@ class SolverEngine(object):
         for x in to_check:
             if ((occ_after >> x) & 1) != 0:
                 continue  # filled
-            # empty: must have at least one empty neighbor
+            has_empty_neighbor = False
             for n in neighbors[x]:
                 if ((occ_after >> n) & 1) == 0:
+                    has_empty_neighbor = True
                     break
-            else:
+            if not has_empty_neighbor:
                 return True
         return False
 
-    def _components_mod4_ok(self, occ_after, touched_idxs):
-        """NEW: local connected-empty components must have size % 4 == 0."""
-        if not self.COMPONENT_MOD4_PRUNE:
-            return True
-        neighbors = self.neighbors
-        def is_empty(idx):
-            return ((occ_after >> idx) & 1) == 0
-        # Only explore components reachable from empties adjacent to touched
-        frontier = set()
-        for u in touched_idxs:
-            for v in neighbors[u]:
-                if is_empty(v):
-                    frontier.add(v)
-        seen = set()
-        for start in frontier:
-            if start in seen or not is_empty(start):
-                continue
-            # BFS this empty component
-            stack = [start]
-            seen.add(start)
-            count = 0
-            while stack:
-                x = stack.pop()
-                count += 1
-                for w in neighbors[x]:
-                    if w not in seen and is_empty(w):
-                        seen.add(w)
-                        stack.append(w)
-            if (count & 3) != 0:  # not divisible by 4
-                return False
-        return True
-
-    def _exposure_counts_after(self, occ_after, newly_filled_idxs):
+    def _exposure_counts_after(self, occ_after: int, newly_filled_idxs: Tuple[int, ...]) -> Tuple[int,int]:
         neighbors = self.neighbors
         is_boundary = self.is_boundary
         seen = set()
@@ -339,7 +337,7 @@ class SolverEngine(object):
                         bexpo += 1
         return expo, bexpo
 
-    def _leaf_empties_after(self, occ_after, newly_filled_idxs):
+    def _leaf_empties_after(self, occ_after: int, newly_filled_idxs: Tuple[int, ...]) -> int:
         neighbors = self.neighbors
         cand = set()
         for u in newly_filled_idxs:
@@ -358,14 +356,18 @@ class SolverEngine(object):
                 leafs += 1
         return leafs
 
-    # ---------- Choice building / ranking ----------
-    def _build_choices_for_piece(self, piece_key):
+    # --------------------------
+    # Build choices (ranking, cap, roulette)
+    # --------------------------
+    def _build_choices_bits(self, piece_key: str) -> List[Tuple[int,int,int,Tuple[int,...]]]:
         occ = self.occ_bits
         fits_map = self.fits[piece_key]
-        N = len(self.idx2cell)
+        neighbors = self.neighbors
+        idx2cell = self.idx2cell
+        N = len(idx2cell)
         choices = []
 
-        anchor, a_deg = self._select_anchor()
+        anchor, a_deg = self._select_anchor(N, occ)
         if anchor is not None:
             self.anchor_seen.add(anchor)
             if self.last_anchor is not None:
@@ -373,40 +375,35 @@ class SolverEngine(object):
             self.last_anchor = anchor
             self.stat_anchor_deg_hist[a_deg] += 1
 
-        # dynamic cap / roulette based on anchor deg
+        # corridor mode / roulette mode switch
         in_corridor = False
         if anchor is not None:
             if a_deg == 1:
                 in_corridor = True
             elif a_deg == 2 and self.deg2_corridor:
                 in_corridor = True
-        self.in_corridor = bool(in_corridor)
-        self.branch_cap_cur = self.BRANCH_CAP_TIGHT if in_corridor else self.BRANCH_CAP_OPEN
-        self.roulette_cur = "none" if in_corridor else self.ROULETTE_MODE
 
-        anchor_neighbor_set = set(self.neighbors[anchor]) if anchor is not None else set()
+        self.in_corridor   = bool(in_corridor)
+        self.branch_cap_cur = self.BRANCH_CAP_TIGHT if in_corridor else self.BRANCH_CAP_OPEN
+        self.roulette_cur   = "none" if in_corridor else self.ROULETTE_MODE
+
+        anchor_neighbor_set = set(neighbors[anchor]) if anchor is not None else set()
 
         def consider(origin_idx, ori_idx, mask, cells_idx):
             occ_after = occ | mask
             self.stat_considered += 1
-
-            # Hard prunes
             if self._creates_isolated_empty(occ_after, cells_idx):
                 self.stat_pruned_isolated += 1
                 return
-            if not self._components_mod4_ok(occ_after, cells_idx):
-                self.stat_pruned_mod4 += 1
-                return
 
-            # Scores (lower is better)
             e, be = self._exposure_counts_after(occ_after, cells_idx)
-            l = self._leaf_empties_after(occ_after, cells_idx)
+            l     = self._leaf_empties_after(occ_after, cells_idx)
             self.stat_exposure_hist[e] += 1
             self.stat_boundary_exposure_hist[be] += 1
             self.stat_leaf_hist[l] += 1
             score_expo = (self.EXPOSURE_WEIGHT * e) + (self.BOUNDARY_EXPOSURE_WEIGHT * be) + (self.LEAF_WEIGHT * l)
 
-            # Tie-break: cover anchor >> touch anchor >> distance to anchor origin
+            # distance / anchor tie-break
             if anchor is None:
                 dist_score = 0
             else:
@@ -415,13 +412,13 @@ class SolverEngine(object):
                 elif any((ci in anchor_neighbor_set) for ci in cells_idx):
                     dist_score = -5
                 else:
-                    ai, aj, ak = self.idx2cell[anchor]
-                    oi, oj, ok = self.idx2cell[origin_idx]
+                    ai, aj, ak = idx2cell[anchor]
+                    oi, oj, ok = idx2cell[origin_idx]
                     dist_score = abs(ai-oi) + abs(aj-oj) + abs(ak-ok)
 
             choices.append((score_expo, dist_score, origin_idx, ori_idx, mask, cells_idx))
 
-        # Phase 1: anchor-covering fits
+        # Phase 1: try covering the anchor, if possible
         if anchor is not None:
             afits = fits_map.get(anchor)
             if afits:
@@ -429,11 +426,11 @@ class SolverEngine(object):
                     if (occ & mask) == 0:
                         consider(anchor, ori_idx, mask, cells_idx)
 
-        # Fallback if none added
+        # Fallback: any origin (kept tight cap & no roulette in corridor)
         if not choices:
             self.stat_fallback_piece[piece_key] += 1
             for idx in range(N):
-                if ((occ >> idx) & 1) != 0:
+                if self._is_occupied(occ, idx):
                     continue
                 pfits = fits_map.get(idx)
                 if not pfits:
@@ -455,9 +452,9 @@ class SolverEngine(object):
             key = (piece_key, origin_idx, ori_idx)
             deco.append((score_expo, dist_score, tc[key], origin_idx, ori_idx, mask, cells_idx))
 
-        deco.sort(key=lambda x: (x[0], x[1], x[2], x[3], x[4]))  # stable
+        deco.sort(key=lambda x: (x[0], x[1], x[2], x[3], x[4]))
 
-        k = self.branch_cap_cur if self.branch_cap_cur and self.branch_cap_cur > 0 else len(deco)
+        k = self.branch_cap_cur if (self.branch_cap_cur and self.branch_cap_cur > 0) else len(deco)
         top = list(deco[:k])
 
         if self.roulette_cur == "least-tried":
@@ -478,17 +475,17 @@ class SolverEngine(object):
         out = [(origin_idx, ori_idx, mask, cells_idx) for _,_,_, origin_idx, ori_idx, mask, cells_idx in deco]
         return out
 
-    # ---------- Apply / remove ----------
+    # --------------------------
+    # Apply / remove
+    # --------------------------
     def _apply_place(self, piece_key, origin_idx, ori_idx, mask, cells_idx):
         self.occ_bits |= mask
-        cells_xyz = tuple(self.idx2cell[ii] for ii in cells_idx)
         self.placements.append({
             "piece": piece_key,
             "origin_idx": origin_idx,
             "ori_idx": ori_idx,
             "mask": mask,
             "cells_idx": tuple(cells_idx),
-            "cells": cells_xyz,
         })
         self.try_counts[(piece_key, origin_idx, ori_idx)] += 1
 
@@ -499,26 +496,46 @@ class SolverEngine(object):
         self.occ_bits &= ~pl["mask"]
         return pl
 
-    # ---------- Frontier ----------
-    def _build_frontier_for_depth(self, cursor):
+    # --------------------------
+    # Frontier build (DEFENSIVE)
+    # --------------------------
+    def _build_frontier_for_depth(self, cursor: int) -> None:
+        """
+        Build the deque of choices for the current depth if needed.
+        Defensive: if cursor is at/after end of order, do nothing.
+        """
+        if cursor >= len(self.order):
+            return
         piece_key = self.order[cursor]
-        choices = self._build_choices_for_piece(piece_key)
+        choices = self._build_choices_bits(piece_key)
         self.frontier.append(deque(choices))
 
-    # ---------- One step ----------
+    # --------------------------
+    # One search step (+ forced-singletons)
+    # --------------------------
     def step_once(self):
+        """
+        Returns (progressed: bool, solved: bool)
+        """
         if self.dirty or self.solved:
             return False, self.solved
+
         self.attempts += 1
 
-        # solved?
-        if self.cursor >= len(self.order):
+        # Defensive clamp & solved check
+        if self.cursor < 0:
+            self.cursor = 0
+        n_pieces = len(self.order)
+        if self.cursor >= n_pieces:
             self.solved = True
+            # Update best depth if needed
+            if self.placed_count() > self.best_depth_ever:
+                self.best_depth_ever = self.placed_count()
             return True, True
 
         # TT prune?
         if self._tt_should_prune():
-            # backtrack immediately
+            # Backtrack immediately
             if self.cursor == 0:
                 return False, False
             if len(self.frontier) > self.cursor:
@@ -527,22 +544,34 @@ class SolverEngine(object):
             self._remove_last()
             return True, False
 
-        # build frontier if needed
+        # Build frontier if needed (defensive)
+        if self.cursor >= len(self.order):
+            self.solved = True
+            if self.placed_count() > self.best_depth_ever:
+                self.best_depth_ever = self.placed_count()
+            return True, True
         if len(self.frontier) <= self.cursor:
             self._build_frontier_for_depth(self.cursor)
 
         progressed = False
+
         while True:
             if self.cursor >= len(self.order):
                 self.solved = True
+                if self.placed_count() > self.best_depth_ever:
+                    self.best_depth_ever = self.placed_count()
                 return True, True
 
             d = self.frontier[self.cursor]
             if not d:
                 # backtrack
                 if self.cursor == 0:
+                    # update best depth ever even on failure forward
+                    if self.placed_count() > self.best_depth_ever:
+                        self.best_depth_ever = self.placed_count()
                     return progressed, False
-                self.frontier.pop()
+                if len(self.frontier) > self.cursor:
+                    self.frontier.pop()
                 self.cursor -= 1
                 self._remove_last()
                 progressed = True
@@ -568,16 +597,8 @@ class SolverEngine(object):
                 progressed = True
                 break
 
+        # Update best depth ever whenever we move forward
+        if self.placed_count() > self.best_depth_ever:
+            self.best_depth_ever = self.placed_count()
+
         return progressed, False
-
-    # ---------- Introspection ----------
-    def best_depth(self):
-        """Max depth reached this run (current cursor or any prior). Use externally to track global best."""
-        # In-engine, the best-so-far isn't tracked; the CLI tracks it. We expose current depth here.
-        return self.cursor
-
-    def placed_count(self):
-        return len(self.placements)
-
-    def total_pieces(self):
-        return len(self.order)

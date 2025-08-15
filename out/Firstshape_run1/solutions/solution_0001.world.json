@@ -1,8 +1,6 @@
 {
   "meta": {
-    "container": "C:\\Grasshopper\\Projects\\Projects\\2025\\ball puzzle\\solver\\data\\containers\\firstshape.py.json",
-    "pieces": "C:\\Grasshopper\\Projects\\Projects\\2025\\ball puzzle\\solver\\data\\pieces\\pieces.py",
-    "bbox": [
+    "container_bbox": [
       -2,
       5,
       -3,
@@ -10,61 +8,46 @@
       -2,
       5
     ],
-    "present": "auto",
-    "started": "2025-08-14 17:14:45"
+    "r": 0.5,
+    "timestamp": "2025-08-15 06:54:14",
+    "present": {},
+    "tunables": {
+      "branch_cap_open": null,
+      "branch_cap_tight": null,
+      "deg2_corridor": false,
+      "roulette": "none",
+      "TT_MAX": 3000000,
+      "TT_TRIM_KEEP": 2000000
+    },
+    "depth": 1,
+    "solved": false
   },
   "r": 0.5,
-  "depth": 1,
-  "solved": false,
-  "order": [
-    "A",
-    "C",
-    "E",
-    "G",
-    "I",
-    "J",
-    "H",
-    "F",
-    "D",
-    "B",
-    "Y",
-    "X",
-    "W",
-    "L",
-    "K",
-    "V",
-    "U",
-    "T",
-    "N",
-    "M",
-    "S",
-    "R",
-    "Q",
-    "P",
-    "O"
-  ],
-  "cells_by_piece": {
-    "A": [
-      [
-        0,
-        6,
-        4
-      ],
-      [
-        1,
-        5,
-        4
-      ],
-      [
-        1,
-        7,
-        4
-      ],
-      [
-        2,
-        6,
-        4
+  "placements": [
+    {
+      "piece": "A",
+      "cells": [
+        [
+          5,
+          -1,
+          1
+        ],
+        [
+          4,
+          0,
+          1
+        ],
+        [
+          5,
+          -1,
+          2
+        ],
+        [
+          4,
+          0,
+          2
+        ]
       ]
-    ]
-  }
+    }
+  ]
 }

@@ -7,7 +7,7 @@ Layer z=i+j=0:
 .   .   .
   .   .
 .   .   .
-  E   .
+  E   B
 D   .   .
   .   H
 
@@ -18,8 +18,8 @@ Layer z=i+j=1:
 .   .   G
   .   .
 E   .   .
-  D   .
-.   .   H
+  D   B
+.   B   H
 
 Layer z=i+j=2:
 .   .   I
@@ -28,7 +28,7 @@ Layer z=i+j=2:
   .   .
 .   .   .
   .   .
-E   D   .
+E   D   B
   C   H
 
 Layer z=i+j=3:

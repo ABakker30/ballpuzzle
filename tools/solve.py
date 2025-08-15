@@ -1,56 +1,84 @@
 # tools/solve.py
-# Standalone FCC tetra-spheres solver driver (console) — rev13.2
-# - Periodic status printing (default 5s)
-# - Snapshots on improved depth and final solved state
-# - Robust status printing (deg2 corridor flag fallback)
-# - "Best depth (ever)" tracked correctly (monotonic during a run)
+# Standalone FCC tetra-spheres solver driver (rev13.2)
+# - Writes world JSON snapshots + world-view layer printouts
+# - Periodic status with correct attempts/sec (monotonic window)
+# - CLI tunables for branch caps, roulette, TT limits, etc.
 
-import os
-import sys
-import json
-import time
-import argparse
-import importlib.util
+from __future__ import annotations
 
-# -----------------------------------------------------------------------------
-# Resolve project root for imports
-# -----------------------------------------------------------------------------
+import os, sys, json, time, argparse
+from typing import Dict, Tuple, List, Set
+
+# ---------------------------------------------------------------------
+# Import path fix: allow `from core...` when launching from tools/
+# ---------------------------------------------------------------------
 THIS_DIR = os.path.dirname(os.path.abspath(__file__))
-ROOT_DIR = os.path.dirname(THIS_DIR)
+ROOT_DIR = os.path.abspath(os.path.join(THIS_DIR, ".."))
 if ROOT_DIR not in sys.path:
     sys.path.insert(0, ROOT_DIR)
 
-# Import the core engine
-from core.solver_engine import SolverEngine  # noqa: E402
+try:
+    from core.solver_engine import SolverEngine
+except Exception as e:
+    print("[ERR] Could not import core.solver_engine.SolverEngine:", e)
+    raise
+
+try:
+    from core.io_pieces import load_pieces
+except Exception:
+    # Fallback: local loader compatible with PIECES dict in a .py file
+    import importlib.util
+    def _local_load_pieces(py_path: str) -> Dict[str, tuple]:
+        p = py_path.strip()
+        if not p.lower().endswith(".py"):
+            raise IOError("Pieces path must end with .py")
+        if not os.path.isfile(p):
+            raise IOError("File not found: {}".format(p))
+        name = "__pieces__"
+        if name in sys.modules:
+            del sys.modules[name]
+        spec = importlib.util.spec_from_file_location(name, p)
+        if spec is None or spec.loader is None:
+            raise ImportError("Invalid module spec for: {}".format(p))
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        if not hasattr(mod, "PIECES"):
+            raise ImportError("Module has no PIECES dict: {}".format(p))
+        pieces = {}
+        for key, oris in mod.PIECES.items():
+            norm_oris = []
+            for ori in oris:
+                norm_oris.append(tuple(tuple(int(c) for c in triplet) for triplet in ori))
+            pieces[str(key)] = tuple(norm_oris)
+        return pieces
+    load_pieces = _local_load_pieces
 
 
-# -----------------------------------------------------------------------------
-# I/O helpers
-# -----------------------------------------------------------------------------
-def load_container_json(path):
-    """
-    Load a container JSON produced by our GH utility or hand-authored.
-    Expected keys:
-      - "cells": list of [i, j, k] FCC lattice integer triplets
-      - "r": (optional) sphere radius
-      - optionally "presentation" (ignored by this CLI)
-    Returns: (valid_set, bbox_tuple, r_or_None)
-    """
+# ---------------------------------------------------------------------
+# Container JSON loader
+#   Expects:
+#     {
+#       "r": <float> or "radius": <float>,
+#       "cells": [[i,j,k], ...],
+#       "presentation": { ... }   // optional, not passed to engine; kept in snapshot meta
+#     }
+# ---------------------------------------------------------------------
+def load_container_json(path: str) -> Tuple[Set[Tuple[int,int,int]], Tuple[int,int,int,int,int,int], float, dict]:
     with open(path, "r") as f:
         data = json.load(f)
 
-    # Accept either {"cells": [...]} or {"container": {"cells": [...]}}
-    obj = data
-    if "cells" not in obj and "container" in obj and isinstance(obj["container"], dict):
-        obj = obj["container"]
+    cells = data.get("cells") or data.get("lattice") or []
+    if not isinstance(cells, list) or not cells:
+        raise ValueError("Container JSON missing non-empty 'cells' array")
 
-    cells_raw = obj.get("cells", [])
-    valid_set = set()
+    S: Set[Tuple[int,int,int]] = set()
     imin = jmin = kmin = +10**9
     imax = jmax = kmax = -10**9
-    for c in cells_raw:
+    for c in cells:
+        if not (isinstance(c, (list, tuple)) and len(c) == 3):
+            continue
         i, j, k = int(c[0]), int(c[1]), int(c[2])
-        valid_set.add((i, j, k))
+        S.add((i, j, k))
         if i < imin: imin = i
         if i > imax: imax = i
         if j < jmin: jmin = j
@@ -58,286 +86,331 @@ def load_container_json(path):
         if k < kmin: kmin = k
         if k > kmax: kmax = k
 
-    if not valid_set:
-        bbox = (0, -1, 0, -1, 0, -1)
-    else:
-        bbox = (imin, imax, jmin, jmax, kmin, kmax)
+    if not S:
+        raise ValueError("Container cells parsed to empty set")
 
-    r = obj.get("r", None)
-    return valid_set, bbox, r
-
-
-def load_pieces(py_path):
-    """
-    Dynamically load PIECES dict from a Python file.
-    The module must define PIECES = { "A": (( (di,dj,dz), ... ), ...), ... }
-    """
-    if not os.path.isfile(py_path):
-        raise IOError("File not found: {}".format(py_path))
-    name = "__pieces__"
-    if name in sys.modules:
-        del sys.modules[name]
-    spec = importlib.util.spec_from_file_location(name, py_path)
-    if spec is None or spec.loader is None:
-        raise ImportError("Invalid module spec for: {}".format(py_path))
-    mod = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(mod)
-    if not hasattr(mod, "PIECES"):
-        raise ImportError("Module has no PIECES dict: {}".format(py_path))
-
-    pieces = {}
-    for key, oris in mod.PIECES.items():
-        norm_oris = []
-        for ori in oris:
-            norm_oris.append(tuple(tuple(int(c) for c in triplet) for triplet in ori))
-        pieces[str(key)] = tuple(norm_oris)
-    return pieces
+    r = float(data.get("r", data.get("radius", 1.0)))
+    presentation = data.get("presentation", {})
+    return S, (imin, imax, jmin, jmax, kmin, kmax), r, presentation
 
 
-# -----------------------------------------------------------------------------
-# World view helpers
-# -----------------------------------------------------------------------------
-def ijk_to_world(i, j, k):
-    """FCC world indices: u=x=j+k, v=y=i+k, w=z=i+j"""
-    return (j + k, i + k, i + j)
-
-
-def compute_world_bounds(valid_set):
-    """Compute world (u,v,w) bounds from a set of ijk cells."""
+# ---------------------------------------------------------------------
+# World-view layer formatter (letters by piece)
+# World axes (u,v,w) where:
+#   u = j + k  (x index)
+#   v = i + k  (y index)
+#   w = i + j  (z index / layer)
+# ---------------------------------------------------------------------
+def format_world_layers(valid_set: Set[Tuple[int,int,int]],
+                        placements: List[dict],
+                        empty_char: str = ".") -> str:
+    # bounds + mapping
     umin = vmin = wmin = +10**9
     umax = vmax = wmax = -10**9
+    uvw_to_ijk: Dict[Tuple[int,int,int], Tuple[int,int,int]] = {}
     for (i, j, k) in valid_set:
-        u, v, w = ijk_to_world(i, j, k)
+        u = j + k
+        v = i + k
+        w = i + j
         if u < umin: umin = u
         if u > umax: umax = u
         if v < vmin: vmin = v
         if v > vmax: vmax = v
         if w < wmin: wmin = w
         if w > wmax: wmax = w
-    if umin > umax:  # empty
-        return (0, -1, 0, -1, 0, -1)
-    return (umin, umax, vmin, vmax, wmin, wmax)
+        uvw_to_ijk[(u, v, w)] = (i, j, k)
+
+    # letter map from placements
+    letter_at: Dict[Tuple[int,int,int], str] = {}
+    for pl in placements:
+        piece = str(pl["piece"])
+        for c in pl["cells"]:
+            letter_at[tuple(c)] = piece
+
+    lines = []
+    lines.append("[SOLUTION — world view]")
+    lines.append(f"Legend: rows=y (i+k: {vmin}..{vmax}), cols=x (j+k: {umin}..{umax}), layers=z (i+j: {wmin}..{wmax})")
+    lines.append("")
+    for w in range(wmin, wmax + 1):
+        lines.append(f"Layer z=i+j={w}:")
+        for v in range(vmin, vmax + 1):
+            row = []
+            for u in range(umin, umax + 1):
+                ijk = uvw_to_ijk.get((u, v, w))
+                if ijk is None:
+                    row.append(" ")
+                else:
+                    row.append(letter_at.get(ijk, empty_char))
+            lines.append(" ".join(row).rstrip())
+        lines.append("")
+    return "\n".join(lines)
 
 
-def write_snapshot(out_dir, snap_idx, meta, eng, r):
-    """
-    Write a .world.json snapshot of current placements.
-    Schema:
-      {
-        "meta": {...},
-        "r": <number or null>,
-        "depth": <int>,
-        "solved": <bool>,
-        "order": [...],
-        "cells_by_piece": {
-           "A": [[u,v,w], ...],
-           ...
-        }
-      }
-    """
-    os.makedirs(os.path.join(out_dir, "solutions"), exist_ok=True)
-    fname = f"solution_{snap_idx:04d}.world.json"
-    fpath = os.path.join(out_dir, "solutions", fname)
+# ---------------------------------------------------------------------
+# Snapshot writer (world.json + layout.txt)
+# ---------------------------------------------------------------------
+def ensure_dir(p: str) -> None:
+    if not os.path.isdir(p):
+        os.makedirs(p)
 
-    # Build per-piece world cells from engine placements (using cells_idx -> idx2cell)
-    by_piece = {}
+def _idx_to_cell(eng: SolverEngine, idx: int):
+    if hasattr(eng, "idx2cell"):
+        return eng.idx2cell[idx]
+    if hasattr(eng, "index_to_cell"):
+        return eng.index_to_cell(idx)  # type: ignore
+    raise AttributeError("SolverEngine missing idx2cell mapping")
+
+def _norm_cells_for_pl(eng: SolverEngine, pl: dict):
+    if "cells" in pl:
+        return [tuple(map(int, c)) for c in pl["cells"]]
+    if "cells_idx" in pl:
+        return [tuple(map(int, _idx_to_cell(eng, ii))) for ii in pl["cells_idx"]]
+    return []
+
+def write_snapshot(out_root: str,
+                   snapshot_index: int,
+                   meta: dict,
+                   eng: SolverEngine,
+                   valid_set: Set[Tuple[int,int,int]],
+                   write_layout: bool = True) -> None:
+    sol_dir = os.path.join(out_root, "solutions")
+    ensure_dir(sol_dir)
+
+    seq = snapshot_index + 1
+    base = f"solution_{seq:04d}"
+
+    # placements normalized to cells
+    pl_out = []
     for pl in eng.placements:
-        piece = pl["piece"]
-        world_cells = []
-        for ii in pl["cells_idx"]:
-            i, j, k = eng.idx2cell[ii]
-            world_cells.append(list(ijk_to_world(i, j, k)))
-        by_piece.setdefault(piece, []).extend(world_cells)
+        cells = _norm_cells_for_pl(eng, pl)
+        pl_out.append({"piece": pl.get("piece"), "cells": cells})
 
-    payload = {
-        "meta": meta,
-        "r": r,
-        "depth": len(eng.placements),
-        "solved": bool(getattr(eng, "solved", False)),
-        "order": list(eng.order),
-        "cells_by_piece": by_piece,
-    }
-    with open(fpath, "w") as f:
-        json.dump(payload, f, indent=2)
-    print(f"[write] depth={len(eng.placements):02d} file={fname}")
+    world_json = {"meta": meta, "r": meta.get("r"), "placements": pl_out}
+
+    world_path = os.path.join(sol_dir, f"{base}.world.json")
+    with open(world_path, "w") as f:
+        json.dump(world_json, f, indent=2)
+    print(f"[write] depth={eng.cursor:02d} file={os.path.basename(world_path)}")
+
+    if write_layout:
+        txt_path = os.path.join(sol_dir, f"{base}.layout.txt")
+        txt = format_world_layers(valid_set, pl_out, empty_char=".")
+        with open(txt_path, "w") as f:
+            f.write(txt)
 
 
-# -----------------------------------------------------------------------------
-# Status printing (robust to engine attribute differences)
-# -----------------------------------------------------------------------------
-def _top_transition_str(eng):
+# ---------------------------------------------------------------------
+# Status printing (correct attempts/sec via monotonic window)
+# ---------------------------------------------------------------------
+def _top_transition_str(eng: SolverEngine) -> str:
     trans = getattr(eng, "transitions", {})
     if not trans:
         return "n/a"
-    (a, b), cnt = max(trans.items(), key=lambda kv: kv[1])
-    return f"{a}→{b}: {cnt}"
+    try:
+        (a, b), cnt = max(trans.items(), key=lambda kv: kv[1])
+        return f"{a}→{b}: {cnt}"
+    except Exception:
+        return "n/a"
 
+def print_status(eng: SolverEngine, start_wall: float, meter: dict) -> None:
+    now_mono = time.monotonic()
+    da = eng.attempts - meter["last_attempts"]
+    dt = max(1e-9, now_mono - meter["last_t"])
+    rate = da / dt
+    elapsed = time.time() - start_wall
 
-def print_status(eng, start_t):
-    now = time.time()
-    elapsed = now - start_t
+    best_ever = getattr(eng, "best_depth_ever", eng.cursor)
 
-    # Rolling attempts/s based on last print
-    last_t = getattr(eng, "_last_print_t", start_t)
-    last_a = getattr(eng, "_last_print_attempts", 0)
-    dt = max(1e-6, now - last_t)
-    da = max(0, getattr(eng, "attempts", 0) - last_a)
-    rate = int(da / dt)
-    eng._last_print_t = now
-    eng._last_print_attempts = getattr(eng, "attempts", 0)
+    print(f"[rev13.2] Placed {eng.cursor} / {len(eng.order)} pieces "
+          f"({(100.0*eng.cursor/len(eng.order)):.1f}%) | "
+          f"Best depth (ever): {best_ever} | "
+          f"Rate: {rate:,.0f} attempts/s | elapsed: {elapsed:.1f}s")
 
-    best_ever = getattr(eng, "best_ever", 0)  # FIX: never fall back to current depth
-
-    print(f"[rev13.2] Placed {len(eng.placements)} / {len(eng.order)} pieces "
-          f"({100.0*len(eng.placements)/len(eng.order):.1f}%) | Best depth (ever): {best_ever} "
-          f"| Rate: {rate:,} attempts/s | elapsed: {elapsed:.1f}s")
-
-    TT = getattr(eng, "TT", {})
     tt_hits = getattr(eng, "tt_hits", 0)
     tt_prunes = getattr(eng, "tt_prunes", 0)
-    forced = getattr(eng, "forced_singletons", 0)
-    anchors = getattr(eng, "anchor_seen", set())
-    trans = getattr(eng, "transitions", {})
+    forced_singletons = getattr(eng, "forced_singletons", 0)
+    deg2 = getattr(eng, "deg2_corridor", False)
 
-    print(f"   anchors: {len(anchors)} unique | transitions: {len(trans)} unique "
-          f"(top {_top_transition_str(eng)}) | TT: size={len(TT)} hits={tt_hits} prunes={tt_prunes} | forced-singletons={forced}")
+    print(f"   anchors: {len(getattr(eng, 'anchor_seen', []))} unique | "
+          f"transitions: {len(getattr(eng, 'transitions', {}))} unique "
+          f"(top {_top_transition_str(eng)}) | "
+          f"TT: size={len(getattr(eng, 'TT', {}))} hits={tt_hits} prunes={tt_prunes} | "
+          f"forced-singletons={forced_singletons}")
+    print(f"   search mode: {getattr(eng, 'roulette_mode', 'none')} | "
+          f"branch cap: {getattr(eng, 'branch_cap_cur', '-') } "
+          f"(corridor={getattr(eng, 'in_corridor', False)} deg2={deg2})")
 
-    # Robust deg2 corridor flag lookup (avoid AttributeError)
-    deg2_flag = getattr(eng, "deg2_corridor", None)
-    if deg2_flag is None:
-        deg2_flag = getattr(eng, "corridor_deg2", None)
-    if deg2_flag is None:
-        deg2_flag = getattr(eng, "CORRIDOR_DEG2", False)
+    if getattr(eng, "stat_choices_hist", None):
+        parts = ", ".join(f"{k}: {v}" for k, v in sorted(eng.stat_choices_hist.items()))
+        print("   choices@depth histogram (post-cap): " + parts)
 
-    print(f"   search mode: {getattr(eng, 'roulette_cur', 'n/a')} | branch cap: {getattr(eng, 'branch_cap_cur', 'n/a')} "
-          f"(corridor={getattr(eng, 'in_corridor', False)} deg2={deg2_flag})")
+    if getattr(eng, "stat_exposure_hist", None):
+        keys = sorted(eng.stat_exposure_hist)[:12]
+        print("   exposure buckets (low=better): " +
+              ", ".join(f"{k}: {eng.stat_exposure_hist[k]:,}" for k in keys))
 
-    # Optional tuning histograms (print only if present)
-    ch = getattr(eng, "stat_choices_hist", None)
-    if ch:
-        parts = [f"{k}: {ch[k]}" for k in sorted(ch.keys())]
-        print("   choices@depth histogram (post-cap): " + ", ".join(parts))
+    if getattr(eng, "stat_boundary_exposure_hist", None):
+        keys = sorted(eng.stat_boundary_exposure_hist)[:12]
+        print("   boundary-exposure (low=better): " +
+              ", ".join(f"{k}: {eng.stat_boundary_exposure_hist[k]:,}" for k in keys))
 
-    expo = getattr(eng, "stat_exposure_hist", None)
-    if expo:
-        keys = sorted(expo.keys())
-        show = [f"{k}: {expo[k]:,}" for k in keys[:12]]
-        print("   exposure buckets (low=better): " + ", ".join(show))
+    if getattr(eng, "stat_leaf_hist", None):
+        keys = sorted(eng.stat_leaf_hist)[:12]
+        print("   leaf-empties (lower=better): " +
+              ", ".join(f"{k}: {eng.stat_leaf_hist[k]:,}" for k in keys))
 
-    bexpo = getattr(eng, "stat_boundary_exposure_hist", None)
-    if bexpo:
-        keys = sorted(bexpo.keys())
-        show = [f"{k}: {bexpo[k]:,}" for k in keys[:12]]
-        print("   boundary-exposure (low=better): " + ", ".join(show))
+    if getattr(eng, "stat_anchor_deg_hist", None):
+        parts = " | ".join(f"{k}: {v}" for k, v in sorted(eng.stat_anchor_deg_hist.items()))
+        print("   anchor empty-neighbor degree: " + parts)
 
-    leaf = getattr(eng, "stat_leaf_hist", None)
-    if leaf:
-        keys = sorted(leaf.keys())
-        show = [f"{k}: {leaf[k]:,}" for k in keys[:12]]
-        print("   leaf-empties (lower=better): " + ", ".join(show))
+    if getattr(eng, "stat_fallback_piece", None):
+        top_fb = sorted(eng.stat_fallback_piece.items(), key=lambda kv: -kv[1])[:8]
+        print("   pieces needing fallback origins most: " +
+              ", ".join(f"{k}: {v}" for k, v in top_fb))
 
-    adeg = getattr(eng, "stat_anchor_deg_hist", None)
-    if adeg:
-        parts = [f"{k}: {adeg[k]}" for k in sorted(adeg.keys())]
-        print("   anchor empty-neighbor degree: " + " | ".join(parts))
-
-    fb = getattr(eng, "stat_fallback_piece", None)
-    if fb:
-        top_fb = sorted(fb.items(), key=lambda kv: -kv[1])
-        head = ", ".join(f"{k}: {v}" for k, v in top_fb[:8])
-        print("   pieces needing fallback origins most: " + head)
+    meter["last_t"] = now_mono
+    meter["last_attempts"] = eng.attempts
 
 
-# -----------------------------------------------------------------------------
-# Main loop
-# -----------------------------------------------------------------------------
+# ---------------------------------------------------------------------
+# Argparse
+# ---------------------------------------------------------------------
+def build_argparser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser()
+    p.add_argument("--container", required=True, help="Path to container JSON")
+    p.add_argument("--pieces", required=True, help="Path to pieces.py (PIECES dict)")
+    p.add_argument("--out", required=True, help="Output folder (will create solutions/ inside)")
+    p.add_argument("--present", choices=["auto", "none"], default="auto",
+                   help="Write presentation block from container JSON into snapshots (default auto)")
+    p.add_argument("--status-interval", type=float, default=5.0,
+                   help="Seconds between status prints (0 to disable)")
+    p.add_argument("--snap", choices=["depth", "solved", "none"], default="depth",
+                   help="When to write snapshots (default depth)")
+
+    # Tunables / runtime
+    p.add_argument("--branch-cap-open", type=int, default=None, help="Open region branch cap")
+    p.add_argument("--branch-cap-tight", type=int, default=None, help="Corridor branch cap")
+    p.add_argument("--deg2-corridor", type=int, default=None, help="Enable corridor on degree-2 empties (0/1)")
+    p.add_argument("--roulette", choices=["least-tried", "none"], default=None, help="Roulette mode")
+    p.add_argument("--tt-max", type=int, default=None, help="Transposition table max entries")
+    p.add_argument("--tt-trim-keep", type=int, default=None, help="TT keep entries on trim")
+    p.add_argument("--stagnation-seconds", type=float, default=None, help="Warn if no depth gain for N seconds")
+    p.add_argument("--restart-limit", type=int, default=None, help="(Reserved) max restarts on stagnation")
+    return p
+
+
+# ---------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------
 def main():
-    ap = argparse.ArgumentParser(description="FCC tetra-spheres solver (console) — rev13.2")
-    ap.add_argument("--container", required=True, help="Path to container JSON")
-    ap.add_argument("--pieces", required=True, help="Path to pieces.py")
-    ap.add_argument("--out", required=True, help="Output directory (will create solutions/)")
-    ap.add_argument("--present", choices=["auto", "none"], default="auto",
-                    help="Presentation hint (kept for compatibility; not applied here)")
-    ap.add_argument("--status-interval", type=float, default=5.0,
-                    help="Seconds between status prints (0 to disable)")
-    ap.add_argument("--snap", choices=["depth", "solved", "none"], default="depth",
-                    help="When to write snapshots")
-    ap.add_argument("--max-seconds", type=float, default=0.0, help="Stop after N seconds (0=unbounded)")
-    ap.add_argument("--max-attempts", type=int, default=0, help="Stop after N attempts (0=unbounded)")
-    args = ap.parse_args()
+    args = build_argparser().parse_args()
 
-    os.makedirs(args.out, exist_ok=True)
+    out_root = os.path.abspath(args.out)
+    ensure_dir(out_root)
+    ensure_dir(os.path.join(out_root, "solutions"))
 
-    # Load inputs
-    valid_set, bbox, r_in = load_container_json(args.container)
+    valid_set, bbox, r_in, presentation = load_container_json(args.container)
+    if args.present == "none":
+        presentation = {}
+
     pieces = load_pieces(args.pieces)
 
-    # Init engine with just what it expects
+    # --- Engine: do NOT pass presentation; your SolverEngine doesn't accept it ---
     eng = SolverEngine(pieces=pieces, valid_set=valid_set)
 
-    # Track "best depth ever" MONOTONIC within this run
-    eng.best_ever = 0
+    # Optional display-only best depth
+    eng.best_depth_ever = getattr(eng, "best_depth_ever", 0)
 
-    # Meta for snapshots
-    meta = {
-        "container": os.path.abspath(args.container),
-        "pieces": os.path.abspath(args.pieces),
-        "bbox": bbox,
-        "present": args.present,
-        "started": time.strftime("%Y-%m-%d %H:%M:%S"),
+    # Apply tunables if engine exposes them
+    def maybe_set(obj, name, value):
+        if value is None:
+            return
+        if hasattr(obj, name):
+            setattr(obj, name, value)
+
+    maybe_set(eng, "branch_cap_open", args.branch_cap_open)
+    maybe_set(eng, "branch_cap_tight", args.branch_cap_tight)
+    if args.deg2_corridor is not None:
+        maybe_set(eng, "deg2_corridor", bool(args.deg2_corridor))
+    if args.roulette is not None:
+        maybe_set(eng, "roulette_mode", args.roulette)
+    maybe_set(eng, "TT_MAX", args.tt_max)
+    maybe_set(eng, "TT_TRIM_KEEP", args.tt_trim_keep)
+    maybe_set(eng, "stagnation_seconds", args.stagnation_seconds)
+    maybe_set(eng, "restart_limit", args.restart_limit)
+
+    # Meta base (written into snapshots)
+    meta_base = {
+        "container_bbox": list(bbox),
+        "r": r_in,
+        "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
+        "present": presentation,
+        "tunables": {
+            "branch_cap_open": getattr(eng, "branch_cap_open", None),
+            "branch_cap_tight": getattr(eng, "branch_cap_tight", None),
+            "deg2_corridor": getattr(eng, "deg2_corridor", False),
+            "roulette": getattr(eng, "roulette_mode", "none"),
+            "TT_MAX": getattr(eng, "TT_MAX", None),
+            "TT_TRIM_KEEP": getattr(eng, "TT_TRIM_KEEP", None),
+        }
     }
 
-    start = time.time()
-    last_status = start
-    snap_idx = 1
-    best_written_depth = -1
+    # Status meter baseline (monotonic)
+    status_meter = {"last_t": time.monotonic(), "last_attempts": 0}
+    last_status_t = time.monotonic()
 
-    # Prime rate baseline
-    eng._last_print_t = start
-    eng._last_print_attempts = 0
+    # Stagnation tracking (optional warn)
+    stagnant_since = time.monotonic()
 
-    # Main solve loop
+    # Snapshot control
+    snap_mode = args.snap
+    last_depth_written = -1
+    snap_idx = 0
+
+    # Main loop
+    start_wall = time.time()
+    solved_printed = False
+
     while True:
         progressed, solved = eng.step_once()
 
-        # Update best depth ever (monotonic)
-        if progressed:
-            depth = len(eng.placements)
-            if depth > eng.best_ever:
-                eng.best_ever = depth
+        if eng.cursor > eng.best_depth_ever:
+            eng.best_depth_ever = eng.cursor
+            stagnant_since = time.monotonic()
 
-        # Time/attempt caps
-        if args.max_seconds > 0 and (time.time() - start) >= args.max_seconds:
-            print("[halt] max seconds reached")
-            break
-        if args.max_attempts > 0 and getattr(eng, "attempts", 0) >= args.max_attempts:
-            print("[halt] max attempts reached")
-            break
-
-        # Snapshot on improved depth (if enabled)
-        if progressed and args.snap == "depth":
-            depth = len(eng.placements)
-            if depth > best_written_depth:
-                write_snapshot(args.out, snap_idx, meta, eng, r_in)
-                snap_idx += 1
-                best_written_depth = depth
-
-        # Periodic status
-        if args.status_interval > 0:
-            now = time.time()
-            if now - last_status >= args.status_interval:
-                print_status(eng, start)
-                last_status = now
+        if snap_mode == "depth" and eng.cursor > last_depth_written:
+            meta = dict(meta_base)
+            meta.update({"depth": eng.cursor, "solved": bool(solved)})
+            write_snapshot(out_root, snap_idx, meta, eng, valid_set, write_layout=True)
+            snap_idx += 1
+            last_depth_written = eng.cursor
 
         if solved:
-            print("[solved]")
-            if args.snap != "none":
-                write_snapshot(args.out, snap_idx, meta, eng, r_in)
+            if snap_mode in ("depth", "solved") and last_depth_written != eng.cursor:
+                meta = dict(meta_base)
+                meta.update({"depth": eng.cursor, "solved": True})
+                write_snapshot(out_root, snap_idx, meta, eng, valid_set, write_layout=True)
+                snap_idx += 1
+                last_depth_written = eng.cursor
+            if not solved_printed:
+                print("[solved]")
+                solved_printed = True
             break
 
-    # Final status line (in case we stopped without solved)
-    if not getattr(eng, "solved", False):
-        print_status(eng, start)
+        if args.status_interval and args.status_interval > 0.0:
+            now = time.monotonic()
+            if now - last_status_t >= args.status_interval:
+                print_status(eng, start_wall, status_meter)
+                last_status_t = now
+
+        if args.stagnation_seconds and args.stagnation_seconds > 0:
+            if time.monotonic() - stagnant_since >= args.stagnation_seconds:
+                print(f"[warn] No depth improvement for {args.stagnation_seconds:.0f}s "
+                      f"(best depth so far: {eng.best_depth_ever})")
+                stagnant_since = time.monotonic()
+
+    # Final status with accurate instantaneous rate
+    print_status(eng, start_wall, status_meter)
 
 
 if __name__ == "__main__":

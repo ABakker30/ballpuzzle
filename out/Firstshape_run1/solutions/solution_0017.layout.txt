@@ -2,9 +2,9 @@
 Legend: rows=y (i+k: 0..7), cols=x (j+k: 0..4), layers=z (i+j: 0..4)
 
 Layer z=i+j=0:
-.   .   G
-  .   W
-.   .   W
+.   T   G
+  T   W
+.   T   W
   U   L
 .   L   L
   E   B
@@ -15,7 +15,7 @@ Layer z=i+j=1:
   .   W
 .   .   G
   .   .
-.   .   G
+.   T   G
   U   L
 E   .   Y
   D   B

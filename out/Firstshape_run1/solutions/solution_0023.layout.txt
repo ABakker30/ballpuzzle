@@ -1,10 +1,10 @@
-[SOLUTION — world view]
+[SOLUTION â€” world view]
 Legend: rows=y (i+k: 0..7), cols=x (j+k: 0..4), layers=z (i+j: 0..4)
 
 Layer z=i+j=0:
-T   .   G
-  S   W
-S   M   W
+U   M   G
+  Q   W
+Q   Q   W
   U   L
 S   L   L
   E   B
@@ -13,38 +13,38 @@ D   .   Y
 
 Layer z=i+j=1:
   T   W
-R   .   G
-  .   M
-S   M   G
-  U   L
-E   N   Y
+U   M   G
+  U   M
+.   Q   G
+  S   L
+E   .   Y
   D   B
 .   B   H
 
 Layer z=i+j=2:
 T   W   I
-  Q   M
-R   R   G
-  R   N
-U   N   Y
+  R   M
+.   .   G
+  N   N
+S   N   Y
   X   Y
 E   D   B
   C   H
 
 Layer z=i+j=3:
-  Q   K
+  R   K
 T   K   I
-  Q   V
-U   V   F
+  .   V
+S   V   F
   X   F
 C   N   J
   C   D
 E   J   H
 
 Layer z=i+j=4:
-.   K   I
-  .   K
-V   Q   I
+T   K   I
+  R   K
+V   R   I
   V   X
 C   X   F
   A   F

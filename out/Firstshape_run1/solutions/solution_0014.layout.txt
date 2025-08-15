@@ -32,8 +32,8 @@ E   D   B
   C   H
 
 Layer z=i+j=3:
-  .   .
-.   .   I
+  .   K
+.   K   I
   .   .
 .   .   F
   X   F
@@ -42,8 +42,8 @@ C   .   J
 E   J   H
 
 Layer z=i+j=4:
-.   .   I
-  .   .
+.   K   I
+  .   K
 .   .   I
   .   X
 C   X   F
